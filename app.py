@@ -5,7 +5,6 @@ Deploy:       Streamlit Community Cloud (add GEMINI_API_KEY / GROQ_API_KEY in Se
 """
 import os
 import re
-import json
 import smtplib
 import datetime as dt
 from email.message import EmailMessage
@@ -29,8 +28,9 @@ def secret(name, default=None):
         return os.environ.get(name) or default
 
 
-def send_report_email(to_addr, subject, text_body, html_body, run_json, as_of, note=""):
-    """Sends the memo through the SMTP account in Streamlit Secrets (e.g. Gmail with an app password)."""
+def send_report_email(to_addr, subject, text_body, html_body, pdf_bytes, pdf_name, note=""):
+    """Sends the memo (in the email body) with the PDF report attached, through the SMTP account
+    in Streamlit Secrets (e.g. Gmail with an app password)."""
     from html import escape
     user = secret("SMTP_USER")
     msg = EmailMessage()
@@ -42,10 +42,7 @@ def send_report_email(to_addr, subject, text_body, html_body, run_json, as_of, n
         html_body = html_body.replace(
             "<h2", f'<p style="background:#eef;padding:8px 12px">{escape(note.strip())}</p><h2', 1)
     msg.add_alternative(html_body, subtype="html")
-    msg.add_attachment(html_body.encode(), maintype="text", subtype="html",
-                       filename=f"cocoa_hedge_memo_{as_of}.html")
-    msg.add_attachment(run_json.encode(), maintype="application", subtype="json",
-                       filename=f"cocoa_agent_run_{as_of}.json")
+    msg.add_attachment(pdf_bytes, maintype="application", subtype="pdf", filename=pdf_name)
     host = secret("SMTP_HOST", "smtp.gmail.com")
     port = int(secret("SMTP_PORT", 465))
     if port == 465:
@@ -193,29 +190,32 @@ if results and st.session_state.get("results_key") == (as_of.isoformat(), horizo
     if res["validation_notes"]:
         st.caption("Validation notes: " + "; ".join(res["validation_notes"]))
 
+    table = None
+    if len(actual):
+        strategies = {"No hedge (buy monthly)": 0.0, "Fixed 50%": 50.0, "Full hedge": 100.0,
+                      "Rules baseline": rules["hedge_pct"], "AI agent": float(np.mean(hedges))}
+        costs = {k: C.simulate_cost(actual, locked, h, profile.monthly_cocoa_t) for k, h in strategies.items()}
+        best = min(costs["No hedge (buy monthly)"], costs["Full hedge"])
+        table = pd.DataFrame([{"Strategy": k, "Hedge %": round(h),
+                               "Avg price paid ($/t)": round(costs[k] / (profile.monthly_cocoa_t * len(actual))),
+                               "Total cost ($)": round(costs[k]),
+                               "Extra cost vs best in hindsight ($)": round(costs[k] - best)}
+                              for k, h in strategies.items()])
+
     tab_memo, tab_test, tab_ev, tab_trace = st.tabs(["CFO memo", "Check against reality", "Evidence", "Agent trace"])
 
     with tab_memo:
         st.markdown(md(C.render_memo(res)))
 
     with tab_test:
-        if len(actual):
-            strategies = {"No hedge (buy monthly)": 0.0, "Fixed 50%": 50.0, "Full hedge": 100.0,
-                          "Rules baseline": rules["hedge_pct"], "AI agent": float(np.mean(hedges))}
-            costs = {k: C.simulate_cost(actual, locked, h, profile.monthly_cocoa_t) for k, h in strategies.items()}
-            best = min(costs["No hedge (buy monthly)"], costs["Full hedge"])
-            table = pd.DataFrame([{"Strategy": k, "Hedge %": round(h),
-                                   "Avg price paid ($/t)": round(costs[k] / (profile.monthly_cocoa_t * len(actual))),
-                                   "Total cost ($)": round(costs[k]),
-                                   "Extra cost vs best in hindsight ($)": round(costs[k] - best)}
-                                  for k, h in strategies.items()])
+        if table is not None:
             st.write(f"Actual average price over the next {len(actual)} month(s): **${actual.mean():,.0f}/t** "
                      f"(decision-date price ${locked:,.0f}/t).".replace("$", "\\$"))
             st.dataframe(table, hide_index=True, width="stretch")
             st.bar_chart(table.set_index("Strategy")["Avg price paid ($/t)"])
             st.caption("Simplification: the decision-date futures price is used as the forward price.")
         else:
-            st.write("No actual prices after this date yet. Download the run and compare later.")
+            st.write("No actual prices after this date yet. Download the PDF report and compare later.")
         st.subheader("Scenario margins at the recommended hedge")
         st.dataframe(pd.DataFrame(res["scenario_margins"]), hide_index=True, width="stretch")
 
@@ -231,13 +231,19 @@ if results and st.session_state.get("results_key") == (as_of.isoformat(), horizo
     with tab_trace:
         st.dataframe(pd.DataFrame(res["trace"]), hide_index=True, width="stretch")
 
+    # PDF is built once per agent run and reused for download and email
+    pdf_key = (res["as_of"], res["seconds"], res["model"], len(results))
+    if st.session_state.get("pdf_key") != pdf_key:
+        import matplotlib.pyplot as plt
+        fig = C.plot_price_history(data, [res["as_of"]], start="2023-01-01")
+        st.session_state["pdf_bytes"] = C.render_memo_pdf(res, chart_fig=fig, reality_table=table)
+        plt.close(fig)
+        st.session_state["pdf_key"] = pdf_key
+    report_pdf = st.session_state["pdf_bytes"]
     report_html = C.render_memo_html(res)
-    run_json = json.dumps(results, indent=2, default=str)
-    d1, d2 = st.columns(2)
-    d1.download_button("Download report (HTML)", report_html, file_name=f"cocoa_hedge_memo_{res['as_of']}.html",
-                       mime="text/html")
-    d2.download_button("Download run (JSON)", run_json, file_name=f"cocoa_agent_run_{res['as_of']}.json",
-                       mime="application/json")
+    pdf_name = f"cocoa_hedge_memo_{res['as_of']}.pdf"
+    st.download_button("Download report (PDF)", report_pdf, file_name=pdf_name, mime="application/pdf",
+                       type="primary")
 
     # ---------------- email the report
     st.subheader("Email this report")
@@ -254,7 +260,7 @@ if results and st.session_state.get("results_key") == (as_of.isoformat(), horizo
         limit_left = MAX_EMAILS_PER_SESSION - st.session_state["emails_sent"]
         if e1.button("Send email", type="primary", disabled=not valid or limit_left <= 0):
             try:
-                send_report_email(to_addr.strip(), subject, text_body, report_html, run_json, res["as_of"], note)
+                send_report_email(to_addr.strip(), subject, text_body, report_html, report_pdf, pdf_name, note)
                 st.session_state["emails_sent"] += 1
                 st.success(f"Report sent to {to_addr.strip()}")
             except Exception as ex:
@@ -264,7 +270,8 @@ if results and st.session_state.get("results_key") == (as_of.isoformat(), horizo
     else:
         e1.caption("Direct sending is not set up on this app. Use your own email app instead.")
     # mailto works without any setup: opens the user's own email app with the memo filled in
-    body = text_body if len(text_body) < 1800 else text_body[:1800] + "\n\n[Shortened - download the HTML report for the full memo]"
+    body = text_body if len(text_body) < 1800 else text_body[:1800] + "\n\n[Shortened - see the attached PDF for the full memo]"
+    e2.caption("Your email app cannot attach files automatically: download the PDF above and attach it.")
     mailto = f"mailto:{to_addr.strip() if valid else ''}?subject={quote(subject)}&body={quote(body)}"
     e2.link_button("Open in my email app", mailto)
     if to_addr and not valid:

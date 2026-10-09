@@ -1048,6 +1048,136 @@ def render_memo_text(res: dict) -> str:
     return "\n".join(t)
 
 
+_PDF_CHARS = {"→": "->", "←": "<-", "↑": "up", "↓": "down", "≈": "~", "≤": "<=",
+              "≥": ">=", "×": "x", "−": "-", "‑": "-", " ": " ", " ": " ",
+              " ": " ", "′": "'", "″": '"', "±": "+/-"}
+
+
+def _pdf_text(s) -> str:
+    """Escape for ReportLab paragraphs and keep only characters the built-in PDF fonts can draw."""
+    from html import escape
+    s = str(s)
+    for k, v in _PDF_CHARS.items():
+        s = s.replace(k, v)
+    s = s.encode("cp1252", "replace").decode("cp1252")
+    return escape(s, quote=False)
+
+
+def render_memo_pdf(res: dict, chart_fig=None, reality_table: Optional[pd.DataFrame] = None) -> bytes:
+    """CFO memo as a PDF. Optional: the price chart (matplotlib figure) and the
+    'check against reality' table for past decision dates."""
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import mm
+    from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image,
+                                    ListFlowable, ListItem, KeepTogether)
+
+    r = res["recommendation"]
+    T = _pdf_text
+    ss = getSampleStyleSheet()
+    body = ParagraphStyle("body", parent=ss["BodyText"], fontSize=10, leading=14)
+    small = ParagraphStyle("small", parent=body, fontSize=8, leading=10.5, textColor=colors.HexColor("#444444"))
+    h1 = ParagraphStyle("h1", parent=ss["Heading1"], fontSize=17, spaceAfter=2)
+    h2 = ParagraphStyle("h2", parent=ss["Heading2"], fontSize=12, spaceBefore=10, spaceAfter=4,
+                        textColor=colors.HexColor("#4a2c17"))
+    cell = ParagraphStyle("cell", parent=body, fontSize=9, leading=11)
+    brown, cream = colors.HexColor("#6b4226"), colors.HexColor("#f3efe8")
+
+    def bullets(items, style=body):
+        items = [i for i in items if str(i).strip()]
+        if not items:
+            return Paragraph("-", style)
+        return ListFlowable([ListItem(Paragraph(i, style), leftIndent=10) for i in items],
+                            bulletType="bullet", start="•", leftIndent=10, bulletFontSize=8)
+
+    def grid(rows, widths, header_bg=brown):
+        t = Table(rows, colWidths=widths, repeatRows=1)
+        t.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), header_bg), ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"), ("FONTSIZE", (0, 0), (-1, -1), 9),
+            ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#bbbbbb")),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f7f5f1")]),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"), ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4)]))
+        return t
+
+    story = [
+        Paragraph(f"Cocoa hedge memo &ndash; {T(res['as_of'])}", h1),
+        Paragraph(f"To: CFO, {T(res['profile']['name'])}", small),
+        Spacer(1, 8),
+    ]
+    rec_box = Table([[Paragraph(
+        f"<b>Recommendation:</b> buy forward <b>{r['recommended_hedge_pct']:.0f}%</b> of the next "
+        f"{res['config']['horizon_months']} months' cocoa need at about ${res['locked_price_usd_t']:,}/t "
+        f"(currently {res['profile']['current_hedge_pct']:.0f}%). Confidence: <b>{T(r['confidence'])}</b>.", body)]],
+        colWidths=[170 * mm])
+    rec_box.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, -1), cream),
+                                 ("LINEBEFORE", (0, 0), (0, -1), 3, brown),
+                                 ("LEFTPADDING", (0, 0), (-1, -1), 8), ("TOPPADDING", (0, 0), (-1, -1), 6),
+                                 ("BOTTOMPADDING", (0, 0), (-1, -1), 6)]))
+    story += [rec_box, Paragraph("Situation", h2), Paragraph(T(r["situation"]), body)]
+
+    story += [Paragraph("Key drivers", h2), bullets([
+        f"{T(d.get('driver', ''))} <i>({T(d.get('direction', ''))})</i> "
+        f"<font color='#777777'>[{T(', '.join(d.get('evidence_ids', []) or []))}]</font>"
+        for d in r.get("key_drivers", []) if isinstance(d, dict)])]
+
+    head = ParagraphStyle("head", parent=cell, textColor=colors.white, fontName="Helvetica-Bold")
+    rows = [[Paragraph(h, head) for h in ["Scenario", "Probability", "Avg price $/t", "Margin with hedge",
+                                          "Margin unhedged"]]]
+    for s in res["scenario_margins"]:
+        rows.append([Paragraph(T(s["scenario"]), cell), f"{s['probability']:.0%}", f"${s['avg_price_usd_t']:,}",
+                     f"{s['margin_pct_with_hedge']}%", f"{s['margin_pct_no_hedge']}%"])
+    story += [Paragraph("Scenarios", h2), grid(rows, [62 * mm, 24 * mm, 28 * mm, 28 * mm, 28 * mm]),
+              Spacer(1, 4), Paragraph(f"Probability-weighted price: ${res['expected_price_usd_t']:,}/t", small)]
+
+    story += [Paragraph("Why", h2), Paragraph(T(r["recommendation_rationale"]), body),
+              Paragraph("Risks and limits", h2), bullets([T(x) for x in r.get("risks_and_limits", []) or []])]
+
+    if chart_fig is not None:
+        buf = io.BytesIO()
+        chart_fig.savefig(buf, format="png", dpi=160, bbox_inches="tight")
+        buf.seek(0)
+        w = 170 * mm
+        h = w * chart_fig.get_size_inches()[1] / chart_fig.get_size_inches()[0]
+        story += [KeepTogether([Paragraph("Price history and decision date", h2), Image(buf, width=w, height=h)])]
+
+    if reality_table is not None and len(reality_table):
+        rows = [[Paragraph(T(c), head) for c in reality_table.columns]]
+        for _, row in reality_table.iterrows():
+            rows.append([Paragraph(T(f"{v:,}" if isinstance(v, (int, np.integer)) else v), cell) for v in row])
+        n = len(reality_table.columns)
+        story += [KeepTogether([Paragraph("Check against reality", h2),
+                                grid(rows, [170 * mm / n] * n),
+                                Paragraph("Hedged share bought at the decision-date price; the rest at each "
+                                          "month's actual average price.", small)])]
+
+    ec = r.get("_evidence_check", {})
+    srcs = [f"<b>{T(x['id'])}</b> {T(x['detail'])}"
+            + (f" &ndash; <link href='{T(x['url'])}' color='blue'>source</link>" if x["url"] else "")
+            for x in res["evidence"] if x["id"] != "CALC"]
+    story += [Paragraph("Sources", h2), bullets(srcs, small), Spacer(1, 8),
+              Paragraph(f"Evidence check: {len(ec.get('valid', []))} of {len(ec.get('cited', []))} cited ids found in "
+                        f"tool results. Model: {T(res['model'])}. Fictional company &ndash; teaching demo, "
+                        f"not investment advice.", small)]
+
+    def footer(canvas, doc):
+        canvas.saveState()
+        canvas.setFont("Helvetica", 7.5)
+        canvas.setFillColor(colors.HexColor("#777777"))
+        canvas.drawString(20 * mm, 10 * mm, "Cocoa Procurement Agent - AI Agents in Business, Case 1")
+        canvas.drawRightString(190 * mm, 10 * mm, f"Page {doc.page}")
+        canvas.restoreState()
+
+    out = io.BytesIO()
+    doc = SimpleDocTemplate(out, pagesize=A4, leftMargin=20 * mm, rightMargin=20 * mm, topMargin=18 * mm,
+                            bottomMargin=18 * mm, title=f"Cocoa hedge memo {res['as_of']}",
+                            author="Cocoa Procurement Agent")
+    doc.build(story, onFirstPage=footer, onLaterPages=footer)
+    return out.getvalue()
+
+
 def render_memo_html(res: dict) -> str:
     """Self-contained HTML report for email and download."""
     from html import escape as e

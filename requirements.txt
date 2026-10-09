@@ -5,3 +5,4 @@ requests
 yfinance
 openai>=1.40
 matplotlib
+reportlab
