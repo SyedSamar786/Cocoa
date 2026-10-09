@@ -1,0 +1,7 @@
+streamlit>=1.48
+pandas>=2.0
+numpy
+requests
+yfinance
+openai>=1.40
+matplotlib
