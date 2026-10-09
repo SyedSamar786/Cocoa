@@ -4,8 +4,12 @@ Run locally:  streamlit run app.py
 Deploy:       Streamlit Community Cloud (add GEMINI_API_KEY / GROQ_API_KEY in Secrets)
 """
 import os
+import re
 import json
+import smtplib
 import datetime as dt
+from email.message import EmailMessage
+from urllib.parse import quote
 
 import numpy as np
 import pandas as pd
@@ -14,14 +18,45 @@ import streamlit as st
 import cocoa_agent_core as C
 
 st.set_page_config(page_title="Cocoa Procurement Agent", page_icon="🍫", layout="wide")
-MAX_RUNS_PER_SESSION = 5   # protects the shared free API quota
+MAX_RUNS_PER_SESSION = 5     # protects the shared free API quota
+MAX_EMAILS_PER_SESSION = 3   # stops the app being used to send bulk email
 
 
-def secret(name):
+def secret(name, default=None):
     try:
-        return st.secrets.get(name) or os.environ.get(name)
+        return st.secrets.get(name) or os.environ.get(name) or default
     except Exception:
-        return os.environ.get(name)
+        return os.environ.get(name) or default
+
+
+def send_report_email(to_addr, subject, text_body, html_body, run_json, as_of, note=""):
+    """Sends the memo through the SMTP account in Streamlit Secrets (e.g. Gmail with an app password)."""
+    from html import escape
+    user = secret("SMTP_USER")
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = f"{secret('SMTP_FROM_NAME', 'Cocoa Procurement Agent')} <{user}>"
+    msg["To"] = to_addr
+    msg.set_content(text_body)
+    if note.strip():
+        html_body = html_body.replace(
+            "<h2", f'<p style="background:#eef;padding:8px 12px">{escape(note.strip())}</p><h2', 1)
+    msg.add_alternative(html_body, subtype="html")
+    msg.add_attachment(html_body.encode(), maintype="text", subtype="html",
+                       filename=f"cocoa_hedge_memo_{as_of}.html")
+    msg.add_attachment(run_json.encode(), maintype="application", subtype="json",
+                       filename=f"cocoa_agent_run_{as_of}.json")
+    host = secret("SMTP_HOST", "smtp.gmail.com")
+    port = int(secret("SMTP_PORT", 465))
+    if port == 465:
+        with smtplib.SMTP_SSL(host, port, timeout=30) as s:
+            s.login(user, secret("SMTP_PASSWORD"))
+            s.send_message(msg)
+    else:
+        with smtplib.SMTP(host, port, timeout=30) as s:
+            s.starttls()
+            s.login(user, secret("SMTP_PASSWORD"))
+            s.send_message(msg)
 
 
 def md(text: str) -> str:
@@ -196,5 +231,41 @@ if results and st.session_state.get("results_key") == (as_of.isoformat(), horizo
     with tab_trace:
         st.dataframe(pd.DataFrame(res["trace"]), hide_index=True, width="stretch")
 
-    st.download_button("Download run (JSON)", json.dumps(results, indent=2, default=str),
-                       file_name=f"cocoa_agent_run_{res['as_of']}.json", mime="application/json")
+    report_html = C.render_memo_html(res)
+    run_json = json.dumps(results, indent=2, default=str)
+    d1, d2 = st.columns(2)
+    d1.download_button("Download report (HTML)", report_html, file_name=f"cocoa_hedge_memo_{res['as_of']}.html",
+                       mime="text/html")
+    d2.download_button("Download run (JSON)", run_json, file_name=f"cocoa_agent_run_{res['as_of']}.json",
+                       mime="application/json")
+
+    # ---------------- email the report
+    st.subheader("Email this report")
+    smtp_ready = bool(secret("SMTP_USER") and secret("SMTP_PASSWORD"))
+    st.session_state.setdefault("emails_sent", 0)
+    to_addr = st.text_input("Recipient email", placeholder="name@example.com")
+    note = st.text_area("Short note (optional)", max_chars=300, height=70)
+    valid = bool(re.fullmatch(r"[^@\s]+@[^@\s]+\.[A-Za-z]{2,}", to_addr.strip()))
+    subject = f"Cocoa hedge memo {res['as_of']} - recommend {rec['recommended_hedge_pct']:.0f}% hedge"
+    text_body = (note.strip() + "\n\n" if note.strip() else "") + C.render_memo_text(res)
+
+    e1, e2 = st.columns(2)
+    if smtp_ready:
+        limit_left = MAX_EMAILS_PER_SESSION - st.session_state["emails_sent"]
+        if e1.button("Send email", type="primary", disabled=not valid or limit_left <= 0):
+            try:
+                send_report_email(to_addr.strip(), subject, text_body, report_html, run_json, res["as_of"], note)
+                st.session_state["emails_sent"] += 1
+                st.success(f"Report sent to {to_addr.strip()}")
+            except Exception as ex:
+                st.error(f"Email could not be sent: {str(ex)[:300]}")
+        if limit_left <= 0:
+            st.caption("Email limit for this session reached. Use 'Open in my email app' instead.")
+    else:
+        e1.caption("Direct sending is not set up on this app. Use your own email app instead.")
+    # mailto works without any setup: opens the user's own email app with the memo filled in
+    body = text_body if len(text_body) < 1800 else text_body[:1800] + "\n\n[Shortened - download the HTML report for the full memo]"
+    mailto = f"mailto:{to_addr.strip() if valid else ''}?subject={quote(subject)}&body={quote(body)}"
+    e2.link_button("Open in my email app", mailto)
+    if to_addr and not valid:
+        st.caption(":red[Enter a valid email address.]")
